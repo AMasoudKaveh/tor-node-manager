@@ -346,3 +346,17 @@ This prevents the SOCKS5 proxy from being exposed publicly on the internet.
 ## License
 
 No license has been selected yet. Add a license before distributing or publishing this project for public use.
+
+# Author
+
+**Masoud Kaveh**
+
+GitHub:  
+https://github.com/AMasoudKaveh
+
+Telegram:  
+https://t.me/MasoudOpenSourceLab
+
+---
+
+If this project is useful to you, consider giving the repository a ⭐ on GitHub.
