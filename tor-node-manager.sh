@@ -14,12 +14,20 @@ LOG_BASE="/var/log/tor-multi"
 DEFAULT_ATTEMPTS=8
 DEFAULT_WAIT=70
 
-# Countries shown in the menu: code|name|default_port
+# Fallback countries used when the live Tor directory lookup is unavailable.
+# The interactive menu normally discovers every country with a currently running
+# Tor exit relay from Onionoo, so it stays current without script updates.
 COUNTRIES=(
-  "tr|Turkey|9053"
-  "de|Germany|9054"
-  "nl|Netherlands|9055"
-  "fr|France|9056"
+  "us|United States"
+  "fr|France"
+  "nl|Netherlands"
+  "tr|Turkey"
+  "ch|Switzerland"
+  "se|Sweden"
+  "gb|United Kingdom"
+  "ca|Canada"
+  "mx|Mexico"
+  "de|Germany"
 )
 
 RED='\033[0;31m'
@@ -50,6 +58,7 @@ Usage:
   $0 test <country_code>
   $0 delete <country_code>
   $0 restart <country_code>
+  $0 upgrade
   $0 list
   $0 json <country_code>
   $0 logs <country_code>
@@ -62,7 +71,9 @@ Examples:
 Notes:
   - Creates local SOCKS5 only: 127.0.0.1:<port>
   - Does not edit x-ui / 3x-ui / Xray.
-  - Country codes are ISO-3166 alpha-2, lowercase or uppercase accepted, e.g. tr, de, nl, fr.
+  - Country codes are ISO-3166 alpha-2, lowercase or uppercase accepted.
+  - The menu fetches countries with currently running Tor exits from Onionoo.
+  - Tor carries TCP streams; applications must not send UDP/QUIC to these SOCKS ports.
 USAGE
 }
 
@@ -122,11 +133,17 @@ load_meta() {
 }
 
 install_deps() {
+  if command -v tor >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 &&
+     command -v jq >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 &&
+     command -v nc >/dev/null 2>&1 &&
+     [[ -r /usr/share/iso-codes/json/iso_3166-1.json ]]; then
+    return 0
+  fi
   msg "Installing dependencies"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y tor curl jq ca-certificates iproute2 netcat-openbsd
+    apt-get install -y tor curl jq ca-certificates iproute2 netcat-openbsd iso-codes
   else
     err "This script currently supports Debian/Ubuntu apt-based systems."
     exit 1
@@ -194,7 +211,7 @@ write_node_files() {
 
   cat > "$torrc" <<TORRC
 # Managed by ${APP_NAME}. Do not edit manually unless you know what you are doing.
-SocksPort 127.0.0.1:${port}
+SocksPort 127.0.0.1:${port} IsolateSOCKSAuth
 DataDirectory ${data_dir}
 Log notice file ${log_file}
 
@@ -202,7 +219,8 @@ ClientOnly 1
 ExitNodes {${cc}}
 StrictNodes 1
 AvoidDiskWrites 1
-SafeSocks 1
+SafeSocks 0
+ClientUseIPv6 0
 TORRC
 
   cat > "$unit" <<UNIT
@@ -265,12 +283,28 @@ get_tor_status() {
 }
 
 get_geo_votes() {
-  local port="$1" c1 c2 c3 c4
+  local port="$1" ip="${2:-}" onionoo c1 c2 c3 c4
+  if [[ -n "$ip" ]]; then
+    onionoo="$(curl --silent --show-error --location --max-time 20 --connect-timeout 8 \
+      "https://onionoo.torproject.org/details?search=${ip}" 2>/dev/null | \
+      jq -r '.relays[0].country // empty' 2>/dev/null | tr '[:lower:]' '[:upper:]' || true)"
+  fi
   c1="$(curl_socks "$port" "https://ipinfo.io/country" 15 2>/dev/null | tr -d '\r\n \"' | tr '[:lower:]' '[:upper:]' || true)"
   c2="$(curl_socks "$port" "https://ifconfig.co/country-iso" 15 2>/dev/null | tr -d '\r\n \"' | tr '[:lower:]' '[:upper:]' || true)"
   c3="$(curl_socks "$port" "https://ipapi.co/country/" 15 2>/dev/null | tr -d '\r\n \"' | tr '[:lower:]' '[:upper:]' || true)"
   c4="$(curl_socks "$port" "https://api.country.is/" 15 2>/dev/null | jq -r '.country // empty' 2>/dev/null | tr -d '\r\n \"' | tr '[:lower:]' '[:upper:]' || true)"
-  echo "${c1}|${c2}|${c3}|${c4}"
+  echo "${onionoo:-}|${c1}|${c2}|${c3}|${c4}"
+}
+
+connectivity_check() {
+  local port="$1" web telegram
+  web="$(curl --socks5-hostname "127.0.0.1:${port}" --silent --location \
+    --output /dev/null --write-out '%{http_code}' --max-time 20 --connect-timeout 8 \
+    https://example.com/ 2>/dev/null || true)"
+  telegram="$(curl --socks5-hostname "127.0.0.1:${port}" --silent \
+    --output /dev/null --write-out '%{http_code}' --max-time 20 --connect-timeout 8 \
+    https://api.telegram.org/ 2>/dev/null || true)"
+  [[ "$web" == "200" && "$telegram" =~ ^[234][0-9][0-9]$ ]]
 }
 
 print_check_result() {
@@ -305,7 +339,7 @@ health_check() {
     status="$(get_tor_status "$port")"
     is_tor="${status%%|*}"
     ip="${status#*|}"
-    votes="$(get_geo_votes "$port")"
+    votes="$(get_geo_votes "$port" "$ip")"
 
     match_count=0
     IFS='|' read -r -a arr <<< "$votes"
@@ -317,7 +351,7 @@ health_check() {
 
     print_check_result "$expected" "$port" "$is_tor" "$ip" "$votes"
 
-    if [[ "$is_tor" == "true" && "$match_count" -ge 1 ]]; then
+    if [[ "$is_tor" == "true" && "$match_count" -ge 1 ]] && connectivity_check "$port"; then
       ok "Node is healthy. Confirmed Tor exit country: ${expected}"
       return 0
     fi
@@ -334,10 +368,9 @@ health_check() {
 install_node() {
   local cc port svc
   cc="$(normalize_cc "$1")"
+  install_deps
   port="$(validate_port "${2:-$(default_port_for "$cc")}")"
   svc="$(service_name "$cc")"
-
-  install_deps
 
   msg "Installing node: country=${cc}, socks_port=${port}"
   systemctl stop "$svc" 2>/dev/null || true
@@ -367,15 +400,49 @@ install_node() {
 }
 
 default_port_for() {
-  local cc="$1" row rcc name port
-  for row in "${COUNTRIES[@]}"; do
-    IFS='|' read -r rcc name port <<< "$row"
-    if [[ "$rcc" == "$cc" ]]; then
+  local cc="$1" port=9053 mf
+  mf="$(meta_file "$cc")"
+  if [[ -f "$mf" ]]; then
+    # shellcheck disable=SC1090
+    source "$mf"
+    echo "$SOCKS_PORT"
+    return 0
+  fi
+  while (( port <= 65535 )); do
+    if ! ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . &&
+       ! grep -Rqs "SOCKS_PORT=\"${port}\"" "$NODE_DIR" 2>/dev/null; then
       echo "$port"
       return 0
     fi
+    ((port++))
   done
-  echo "9059"
+  err "No free TCP port found."
+  exit 1
+}
+
+country_name() {
+  local cc_upper
+  cc_upper="$(upper_cc "$1")"
+  if [[ -r /usr/share/iso-codes/json/iso_3166-1.json ]]; then
+    jq -r --arg cc "$cc_upper" \
+      '.["3166-1"][] | select(.alpha_2 == $cc) | .name' \
+      /usr/share/iso-codes/json/iso_3166-1.json 2>/dev/null | head -n1
+  else
+    echo "$cc_upper"
+  fi
+}
+
+available_exit_countries() {
+  local json
+  json="$(curl --silent --show-error --location --max-time 30 --connect-timeout 10 \
+    'https://onionoo.torproject.org/details?type=relay&running=true&flag=Exit&fields=country' \
+    2>/dev/null || true)"
+  if jq -e '.relays | type == "array"' >/dev/null 2>&1 <<< "$json"; then
+    jq -r '.relays[].country // empty' <<< "$json" | \
+      tr '[:upper:]' '[:lower:]' | grep -E '^[a-z]{2}$' | sort -u
+  else
+    printf '%s\n' "${COUNTRIES[@]%%|*}"
+  fi
 }
 
 test_node() {
@@ -394,6 +461,36 @@ restart_node() {
   systemctl restart "$svc"
   sleep 5
   test_node "$cc"
+}
+
+upgrade_nodes() {
+  local mf cc port failed=0
+  install_deps
+  if ! compgen -G "${NODE_DIR}/*.env" >/dev/null; then
+    warn "No installed nodes to upgrade."
+    return 0
+  fi
+  msg "Upgrading installed nodes with current Tor compatibility settings"
+  for mf in "${NODE_DIR}"/*.env; do
+    # shellcheck disable=SC1090
+    source "$mf"
+    cc="$COUNTRY_CODE"
+    port="$SOCKS_PORT"
+    write_node_files "$cc" "$port"
+  done
+  systemctl daemon-reload
+  for mf in "${NODE_DIR}"/*.env; do
+    # shellcheck disable=SC1090
+    source "$mf"
+    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || failed=1
+    systemctl restart "$SERVICE_NAME" || failed=1
+  done
+  if (( failed == 0 )); then
+    ok "All installed nodes were upgraded and restarted."
+  else
+    err "One or more services failed to restart. Run '$0 list' and '$0 logs <country_code>'."
+    return 1
+  fi
 }
 
 delete_node() {
@@ -461,12 +558,8 @@ Xray outbound sample:
   "tag": "${tag}",
   "protocol": "socks",
   "settings": {
-    "servers": [
-      {
-        "address": "127.0.0.1",
-        "port": ${port}
-      }
-    ]
+    "address": "127.0.0.1",
+    "port": ${port}
   },
   "targetStrategy": "AsIs"
 }
@@ -487,33 +580,34 @@ show_logs() {
 }
 
 select_country_menu() {
-  local row i choice cc name port custom_cc custom_port
-  echo "Select country:"
+  local i choice cc name suggested custom_port
+  local -a menu_countries=()
+  install_deps
+  mapfile -t menu_countries < <(available_exit_countries)
+  echo "Select a country with a currently running Tor exit relay:"
   i=1
-  for row in "${COUNTRIES[@]}"; do
-    IFS='|' read -r cc name port <<< "$row"
-    echo "  ${i}) ${name} (${cc^^}) default port ${port}"
+  for cc in "${menu_countries[@]}"; do
+    name="$(country_name "$cc")"
+    printf "  %2d) %-32s (%s)\n" "$i" "${name:-$cc}" "${cc^^}"
     ((i++))
   done
-  echo "  ${i}) Custom country code"
+  echo "  ${i}) Custom ISO country code"
   read -r -p "Choice: " choice
 
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
-    row="${COUNTRIES[$((choice-1))]}"
-    IFS='|' read -r cc name port <<< "$row"
-    read -r -p "SOCKS port [${port}]: " custom_port
-    custom_port="${custom_port:-$port}"
-    install_node "$cc" "$custom_port"
+    cc="${menu_countries[$((choice-1))]}"
   elif [[ "$choice" == "$i" ]]; then
-    read -r -p "Country code, e.g. es: " custom_cc
-    custom_cc="$(normalize_cc "$custom_cc")"
-    read -r -p "SOCKS port [9059]: " custom_port
-    custom_port="${custom_port:-9059}"
-    install_node "$custom_cc" "$custom_port"
+    read -r -p "Country code, e.g. es: " cc
+    cc="$(normalize_cc "$cc")"
   else
     err "Invalid choice"
     exit 1
   fi
+
+  suggested="$(default_port_for "$cc")"
+  read -r -p "SOCKS port [${suggested}]: " custom_port
+  custom_port="${custom_port:-$suggested}"
+  install_node "$cc" "$custom_port"
 }
 
 main_menu() {
@@ -527,6 +621,7 @@ main_menu() {
     echo "5) List nodes"
     echo "6) Show Xray outbound JSON"
     echo "7) Logs"
+    echo "8) Upgrade/fix all installed nodes"
     echo "0) Exit"
     read -r -p "Select: " ans
     case "$ans" in
@@ -537,6 +632,7 @@ main_menu() {
       5) list_nodes ;;
       6) read -r -p "Country code: " cc; print_outbound_json "$cc" ;;
       7) read -r -p "Country code: " cc; show_logs "$cc" ;;
+      8) upgrade_nodes ;;
       0) exit 0 ;;
       *) warn "Invalid choice" ;;
     esac
@@ -552,6 +648,7 @@ main() {
     test) [[ $# -eq 2 ]] || { usage; exit 1; }; test_node "$2" ;;
     delete|remove) [[ $# -eq 2 ]] || { usage; exit 1; }; delete_node "$2" ;;
     restart) [[ $# -eq 2 ]] || { usage; exit 1; }; restart_node "$2" ;;
+    upgrade|fix) [[ $# -eq 1 ]] || { usage; exit 1; }; upgrade_nodes ;;
     list) list_nodes ;;
     json) [[ $# -eq 2 ]] || { usage; exit 1; }; print_outbound_json "$2" ;;
     logs) [[ $# -eq 2 ]] || { usage; exit 1; }; show_logs "$2" ;;
@@ -561,3 +658,4 @@ main() {
 }
 
 main "$@"
+

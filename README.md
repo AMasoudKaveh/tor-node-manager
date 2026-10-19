@@ -3,7 +3,7 @@
 
 A simple Bash-based manager for creating **local Tor SOCKS5 exit nodes** by country.
 
-This tool creates isolated Tor instances such as Turkey, Germany, Netherlands, or France, each running on its own local SOCKS5 port. It is designed to be used as a local SOCKS5 outbound source for tools like Xray, 3x-ui, or any other application that can use a SOCKS5 proxy.
+This tool creates isolated Tor instances by exit country, each running on its own local SOCKS5 port. It is designed to be used as a local SOCKS5 outbound source for tools like Xray, 3x-ui, or any other application that can use a SOCKS5 proxy.
 
 > **Important:** This script does **not** modify x-ui, 3x-ui, Xray, firewall routing rules, or any panel configuration. It only creates local Tor SOCKS5 services on `127.0.0.1:<port>`.
 
@@ -22,19 +22,18 @@ This tool creates isolated Tor instances such as Turkey, Germany, Netherlands, o
 - Delete nodes cleanly
 - View logs per node
 - Interactive menu mode
+- Live menu of every country that currently has a running Tor exit relay
+- Automatic selection of the first available local port
+- Web and Telegram connectivity checks
+- Upgrade/fix command for existing nodes
 
 ---
 
-## Supported Default Countries
+## Available Countries
 
-| Country | Code | Default SOCKS5 Port | Xray Tag |
-|---|---:|---:|---|
-| Turkey | `tr` | `9053` | `tor-tr` |
-| Germany | `de` | `9054` | `tor-de` |
-| Netherlands | `nl` | `9055` | `tor-nl` |
-| France | `fr` | `9056` | `tor-fr` |
+The interactive menu queries the Tor Project's Onionoo service and shows every country that currently has at least one running exit relay. The list therefore follows the live Tor network instead of being hard-coded. If Onionoo is temporarily unavailable, a built-in fallback list is shown.
 
-Custom country codes are also supported using ISO-3166 alpha-2 codes, for example `es`, `us`, `se`, `gb`, etc.
+Custom ISO-3166 alpha-2 country codes are also accepted. Installation can still fail when no usable exit exists for the selected country.
 
 ---
 
@@ -56,11 +55,12 @@ Metadata:      /etc/tor-multi/nodes/tr.env
 The generated Tor configuration uses:
 
 ```text
-SocksPort 127.0.0.1:9053
+SocksPort 127.0.0.1:9053 IsolateSOCKSAuth
 ClientOnly 1
 ExitNodes {tr}
 StrictNodes 1
-SafeSocks 1
+SafeSocks 0
+ClientUseIPv6 0
 ```
 
 This means Tor will only expose a local SOCKS5 proxy and will try to use an exit node from the selected country. With `StrictNodes 1`, the node will fail instead of silently using the wrong country.
@@ -104,6 +104,12 @@ tor-node-manager menu
 tor-node-manager install tr 9053
 ```
 
+Omit the port to automatically select the first available port starting at `9053`:
+
+```bash
+tor-node-manager install tr
+```
+
 ### Install Germany, Netherlands, and France
 
 ```bash
@@ -130,6 +136,8 @@ After installation, the script checks:
 2. The connection is going through Tor
 3. The exit IP country matches the selected country
 4. At least one geo-check provider confirms the expected country
+5. A normal HTTPS website is reachable
+6. Telegram's API endpoint is reachable
 
 Example output:
 
@@ -161,12 +169,8 @@ Example output:
   "tag": "tor-tr",
   "protocol": "socks",
   "settings": {
-    "servers": [
-      {
-        "address": "127.0.0.1",
-        "port": 9053
-      }
-    ]
+    "address": "127.0.0.1",
+    "port": 9053
   },
   "targetStrategy": "AsIs"
 }
@@ -218,6 +222,14 @@ Use your actual inbound tag from your Xray or panel configuration.
 
 ```bash
 tor-node-manager list
+```
+
+### Upgrade/fix all existing nodes
+
+Applies the latest Tor compatibility settings while preserving country and port assignments:
+
+```bash
+tor-node-manager upgrade
 ```
 
 ### Test an installed node
@@ -360,3 +372,4 @@ https://t.me/MasoudOpenSourceLab
 ---
 
 If this project is useful to you, consider giving the repository a ⭐ on GitHub.
+
